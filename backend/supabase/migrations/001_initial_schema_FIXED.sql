@@ -1,0 +1,252 @@
+-- AURA-Auction Database Schema - COMPLETE AND CORRECT
+-- Run this ENTIRE script in Supabase SQL Editor
+
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================
+-- DROP OLD TABLES (START FRESH)
+-- ============================================
+DROP TABLE IF EXISTS chat_messages CASCADE;
+DROP TABLE IF EXISTS tracking_events CASCADE;
+DROP TABLE IF EXISTS shipments CASCADE;
+DROP TABLE IF EXISTS refunds CASCADE;
+DROP TABLE IF EXISTS disputes CASCADE;
+DROP TABLE IF EXISTS payment_attempts CASCADE;
+DROP TABLE IF EXISTS payments CASCADE;
+DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS audit_log CASCADE;
+DROP TABLE IF EXISTS rate_limits CASCADE;
+DROP TABLE IF EXISTS heap_state_snapshots CASCADE;
+DROP TABLE IF EXISTS auction_events CASCADE;
+DROP TABLE IF EXISTS payouts CASCADE;
+DROP TABLE IF EXISTS auction_rules CASCADE;
+DROP TABLE IF EXISTS penalties CASCADE;
+DROP TABLE IF EXISTS governance_actions CASCADE;
+DROP TABLE IF EXISTS risk_scores CASCADE;
+DROP TABLE IF EXISTS devices CASCADE;
+DROP TABLE IF EXISTS verification CASCADE;
+DROP TABLE IF EXISTS watchlist CASCADE;
+DROP TABLE IF EXISTS bids CASCADE;
+DROP TABLE IF EXISTS auctions CASCADE;
+DROP TABLE IF EXISTS profiles CASCADE;
+
+-- ============================================
+-- PROFILES TABLE
+-- ============================================
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  role TEXT NOT NULL DEFAULT 'buyer' CHECK (role IN ('buyer', 'seller', 'admin')),
+  verification_status TEXT NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('verified', 'pending', 'unverified')),
+  trust_score INTEGER NOT NULL DEFAULT 50 CHECK (trust_score >= 0 AND trust_score <= 100),
+  mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Enable RLS
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+
+-- Policies
+CREATE POLICY "Public profiles are viewable by everyone"
+  ON profiles FOR SELECT USING (true);
+
+CREATE POLICY "Users can update own profile"
+  ON profiles FOR UPDATE USING (auth.uid() = id);
+
+-- Auto-create profile on user signup
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO profiles (id, email, name, role)
+  VALUES (
+    NEW.id,
+    NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'name', split_part(NEW.email, '@', 1)),
+    COALESCE(NEW.raw_user_meta_data->>'role', 'buyer')
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+
+-- ============================================
+-- AUCTIONS TABLE
+-- ============================================
+CREATE TABLE auctions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  category TEXT NOT NULL,
+  condition TEXT NOT NULL CHECK (condition IN ('new', 'like_new', 'good', 'fair', 'poor')),
+  images TEXT[] NOT NULL DEFAULT '{}',
+  starting_price DECIMAL(12,2) NOT NULL CHECK (starting_price >= 0),
+  current_bid DECIMAL(12,2) NOT NULL CHECK (current_bid >= 0),
+  reserve_price DECIMAL(12,2) DEFAULT 0,
+  buy_now_price DECIMAL(12,2) DEFAULT 0,
+  min_increment DECIMAL(12,2) NOT NULL DEFAULT 10,
+  seller_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  seller_name TEXT NOT NULL,
+  start_time TIMESTAMPTZ NOT NULL,
+  end_time TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'scheduled', 'live', 'ending_soon', 'ended', 'sold', 'cancelled')),
+  bid_count INTEGER NOT NULL DEFAULT 0,
+  winner_id UUID REFERENCES profiles(id),
+  winner_name TEXT,
+  enable_anti_snipe BOOLEAN NOT NULL DEFAULT TRUE,
+  reserve_met BOOLEAN NOT NULL DEFAULT FALSE,
+  is_live_stream BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE auctions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Auctions are readable by everyone" ON auctions FOR SELECT USING (true);
+CREATE POLICY "Users can create auctions" ON auctions FOR INSERT WITH CHECK (auth.uid() = seller_id);
+CREATE POLICY "Sellers can update their own auctions" ON auctions FOR UPDATE USING (auth.uid() = seller_id);
+
+-- ============================================
+-- BIDS TABLE
+-- ============================================
+CREATE TABLE bids (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
+  bidder_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  bidder_name TEXT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'winning' CHECK (status IN ('winning', 'outbid', 'cancelled')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE bids ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Bids are readable by everyone" ON bids FOR SELECT USING (true);
+CREATE POLICY "Users can place bids" ON bids FOR INSERT WITH CHECK (auth.uid() = bidder_id);
+
+-- ============================================
+-- WATCHLIST TABLE
+-- ============================================
+CREATE TABLE watchlist (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id, auction_id)
+);
+
+ALTER TABLE watchlist ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can see their watchlist" ON watchlist FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage their watchlist" ON watchlist FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can remove from watchlist" ON watchlist FOR DELETE USING (auth.uid() = user_id);
+
+-- ============================================
+-- CHAT MESSAGES TABLE
+-- ============================================
+CREATE TABLE chat_messages (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  user_name TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Chat messages are readable by everyone" ON chat_messages FOR SELECT USING (true);
+CREATE POLICY "Users can send messages" ON chat_messages FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+-- ============================================
+-- FUNCTIONS
+-- ============================================
+
+-- Place a bid with validation
+CREATE OR REPLACE FUNCTION public.place_bid(
+  p_auction_id UUID,
+  p_amount DECIMAL
+)
+RETURNS JSON AS $$
+DECLARE
+  v_auction auctions%ROWTYPE;
+  v_user profiles%ROWTYPE;
+  v_min_bid DECIMAL;
+  v_new_end_time TIMESTAMPTZ;
+BEGIN
+  -- Get auction
+  SELECT * INTO v_auction FROM auctions WHERE id = p_auction_id;
+
+  IF NOT FOUND THEN
+    RETURN json_build_object('success', false, 'error', 'Auction not found');
+  END IF;
+
+  -- Check auction status
+  IF v_auction.status NOT IN ('live', 'ending_soon') THEN
+    RETURN json_build_object('success', false, 'error', 'Auction is not accepting bids');
+  END IF;
+
+  -- Get user
+  SELECT * INTO v_user FROM profiles WHERE id = auth.uid();
+
+  IF NOT FOUND THEN
+    RETURN json_build_object('success', false, 'error', 'User not found');
+  END IF;
+
+  -- Check if user is seller
+  IF v_auction.seller_id = auth.uid() THEN
+    RETURN json_build_object('success', false, 'error', 'Cannot bid on your own auction');
+  END IF;
+
+  -- Check minimum bid
+  v_min_bid := v_auction.current_bid + v_auction.min_increment;
+  IF p_amount < v_min_bid THEN
+    RETURN json_build_object('success', false, 'error', 'Bid must be at least ' || v_min_bid);
+  END IF;
+
+  -- Update previous winning bid to outbid
+  UPDATE bids
+  SET status = 'outbid'
+  WHERE auction_id = p_auction_id AND status = 'winning';
+
+  -- Insert new bid
+  INSERT INTO bids (auction_id, bidder_id, bidder_name, amount, status)
+  VALUES (p_auction_id, auth.uid(), v_user.name, p_amount, 'winning');
+
+  -- Anti-snipe: extend auction if bid in last 2 minutes
+  v_new_end_time := v_auction.end_time;
+  IF v_auction.enable_anti_snipe AND
+     v_auction.end_time - NOW() < INTERVAL '2 minutes' THEN
+    v_new_end_time := v_auction.end_time + INTERVAL '2 minutes';
+  END IF;
+
+  -- Update auction
+  UPDATE auctions SET
+    current_bid = p_amount,
+    bid_count = bid_count + 1,
+    end_time = v_new_end_time,
+    reserve_met = p_amount >= reserve_price,
+    updated_at = NOW()
+  WHERE id = p_auction_id;
+
+  RETURN json_build_object('success', true, 'bid_amount', p_amount);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION public.place_bid(uuid, numeric) TO anon, authenticated;
+
+-- ============================================
+-- GRANT PERMISSIONS
+-- ============================================
+GRANT ALL ON profiles TO authenticated;
+GRANT ALL ON auctions TO authenticated;
+GRANT ALL ON bids TO authenticated;
+GRANT ALL ON watchlist TO authenticated;
+GRANT ALL ON chat_messages TO authenticated;
